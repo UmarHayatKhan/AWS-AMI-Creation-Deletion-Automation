@@ -1,6 +1,6 @@
 # AWS-AMI-Creation-Deletion-Automation
 
-This template will help you automate the AWS EC2 AMI automation. It can easily create AMI based on the time you set to create and will add the retention period to the tag of the AMI. After the retention period is over the Lambda will delete the AMI.
+This template will help you automate the AWS EC2 AMI creation deleteion process. It can easily create AMI based on the time you set to create and will add the retention period to the tag of the AMI. After the retention period is over the Lambda will delete the AMI. Also in case of Failover it will automatically launch the recent AMI.
 
 ## Installation Instructions
  - Create an AWS account if you do not already have one and login.
