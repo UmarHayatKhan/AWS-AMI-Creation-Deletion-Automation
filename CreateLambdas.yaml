@@ -1,0 +1,427 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  AppName:
+    Description: Name of the application.e.g Infra
+    MaxLength: 100
+    MinLength: 1
+    Default: Infra
+    Type: String
+  
+  OperatorEMail:
+    Description: EMail address to notify if there are any status check failed operations
+    Type: String
+    AllowedPattern: >-
+      ([a-zA-Z0-9_\-\.]+)@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.)|(([a-zA-Z0-9\-]+\.)+))([a-zA-Z]{2,4}|[0-9]{1,3})(\]?)
+    ConstraintDescription: must be a valid email address.
+
+  LambdaRate:
+    Description: >
+      The rate (frequency) that determines when CloudWatch Events runs the rule that
+      triggers the AMI Creation Lambda function.
+    Default: rate(1 hour)
+    Type: String
+
+
+Resources:
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  AMICreationLambdaRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: >
+        A schedule for the Lambda function..
+      ScheduleExpression: !Ref LambdaRate
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${AMICreationLambda.Arn}
+          Id: AMICreationLambdaRule
+
+  AMICreationLambdaRulePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Sub ${AMICreationLambda.Arn}
+      Principal: 'events.amazonaws.com'
+      SourceArn: !Sub ${AMICreationLambda.Arn}
+
+  AMIDeletionLambdaRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: >
+        A schedule for the Lambda function..
+      ScheduleExpression: !Ref LambdaRate
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${AMIDeletionLambda.Arn}
+          Id: AMICreationLambdaRule
+
+  AMIDeletionLambdaRulePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Sub ${AMIDeletionLambda.Arn}
+      Principal: 'events.amazonaws.com'
+      SourceArn: !Sub ${AMIDeletionLambda.Arn}
+
+  NotificationTopic:
+    DependsOn: [FailOverLambda] 
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      Subscription:
+        - 
+          Endpoint: !Ref OperatorEMail
+          Protocol: email
+
+        - 
+          Endpoint: !Sub ${FailOverLambda.Arn}
+          Protocol: Lambda
+      TopicName: "Failover-Alarm-Topic"
+
+  AMICreationLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: "Infra-Automate-AMI-Create"
+      Role: !Sub ${LambdaExecutionRole.Arn}
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+            import boto3
+            import collections
+            import datetime
+            import sys
+            import pprint
+            
+            ec = boto3.client("ec2")
+            
+            def lambda_handler(event, context):
+                
+                reservations = ec.describe_instances(
+                    Filters=[
+                        {"Name": "tag-value", "Values": ["backup", "Backup"]},
+                    ]
+                ).get(
+                    "Reservations", []
+                )
+            
+                instances = sum(
+                    [
+                        [i for i in r["Instances"]]
+                        for r in reservations
+                    ], [])
+                print(instances)
+            
+                print("Found %d instances that need backing up" % len(instances))
+            
+                for instance in instances:
+                    print(instance)
+                    try:
+                        retention_days = [
+                            int(t.get("Value")) for t in instance["Tags"]
+                            if t["Key"] == "Retention"][0]
+                    except IndexError:
+                        retention_days = 6
+            
+                    create_time = datetime.datetime.now()
+                    create_fmt = create_time.strftime("%Y-%m-%d %H-%M-%S")
+                    
+                    AMIid = ec.create_image(InstanceId=instance["InstanceId"], Name="Lambda - " + instance["InstanceId"] + 
+                        " from " + create_fmt, Description="Infra-Lambda created AMI of instance " + instance["InstanceId"] +
+                        " from " + create_fmt, NoReboot=True, DryRun=False)
+                        
+                        
+                    delete_date = datetime.datetime.now() + datetime.timedelta(hours=retention_days)
+                    delete_fmt = delete_date.strftime("%m-%d-%Y %H:%M:%S")
+            
+                    ec.create_tags(
+                        Resources=[
+                            AMIid["ImageId"],
+                            ],
+                        Tags=[
+                            {"Key": "Name", "Value": [
+                                t.get("Value") for t in instance["Tags"]
+                                if t["Key"] == "Name"][0]
+                            },
+                            {"Key": "InstanceId", "Value": instance["InstanceId"]},
+                            {"Key": "LaunchTemplateId", "Value":[
+                                t.get("Value") for t in instance["Tags"]
+                                if t["Key"] == "LaunchTemplateId"][0]
+                            },
+                            {"Key": "LaunchTemplateName", "Value": [
+                                t.get("Value") for t in instance["Tags"]
+                                if t["Key"] == "LaunchTemplateName"][0]
+                            },
+                            {"Key": "privateip", "Value": instance["PrivateIpAddress"]
+                            },
+                            {"Key": "DeleteOn", "Value": delete_fmt},
+                        ]
+                    )
+                
+      Runtime: python3.6
+      Timeout: 120
+
+
+  FailOverLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: "Infra-Automate-EC2-FailOver"
+      Role: !Sub ${LambdaExecutionRole.Arn}
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+            import boto3
+            import collections
+            import datetime
+            import sys
+            import pprint
+            import json
+            from dateutil import parser
+            import time
+
+
+
+            ec = boto3.client("ec2")
+            ec2 = boto3.resource("ec2")
+
+            def newest_image(list_of_images):
+                latest = None
+                for image in list_of_images:
+
+                    if not latest:
+                        latest = image
+                        continue
+
+                    if parser.parse(image["CreationDate"]) > parser.parse(latest["CreationDate"]):
+                        latest = image
+
+                return latest
+
+            def lambda_handler(event, context):
+                
+                message = json.loads(event["Records"][0]["Sns"]["Message"])
+                instance_id = message["Trigger"]["Dimensions"][0]["value"]
+                images = ec.describe_images(Owners=["self"],Filters=[{"Name":"tag-value","Values":[instance_id]}, {"Name": "state", "Values": ["available"]}])
+                latest_image = newest_image(images["Images"])
+                response = ec.run_instances(
+                    ImageId=latest_image["ImageId"],
+                    NetworkInterfaces=[
+                        {
+                        "DeviceIndex": 0,
+                        "PrivateIpAddress": [
+                                t.get("Value") for t in latest_image["Tags"]
+                                if t["Key"] == "privateip"][0],
+                        },
+                    ],
+                    
+                    MaxCount=1,
+                    MinCount=1,
+                    LaunchTemplate={
+                        "LaunchTemplateId": [
+                                t.get("Value") for t in latest_image["Tags"]
+                                if t["Key"] == "LaunchTemplateId"][0],
+                    },
+                    TagSpecifications=[
+                        {
+                            "ResourceType": "instance",
+                            "Tags": [
+                                {
+                                    "Key": "Name", 
+                                    "Value": [
+                                    t.get("Value") for t in latest_image["Tags"]
+                                    if t["Key"] == "Name"][0]
+                                },
+                                {
+                                    "Key": "ami-status", 
+                                    "Value": "backup",
+                                    
+                                },
+                                {
+                                    "Key": "LaunchTemplateId", 
+                                    "Value":[
+                                    t.get("Value") for t in latest_image["Tags"]
+                                    if t["Key"] == "LaunchTemplateId"][0]
+                                },
+                                {
+                                    "Key": "LaunchTemplateName", 
+                                    "Value": [
+                                    t.get("Value") for t in latest_image["Tags"]
+                                    if t["Key"] == "LaunchTemplateName"][0]
+                                },
+                                {
+                                    "Key": "privateip", 
+                                    "Value": [
+                                    t.get("Value") for t in latest_image["Tags"]
+                                    if t["Key"] == "privateip"][0]
+                                },
+                                
+                                
+                            ]
+                        },
+                    ],
+                   
+                )
+                cloudwatch = boto3.client("cloudwatch")
+
+                delete_response = cloudwatch.delete_alarms(
+                    AlarmNames=[
+                        instance_id + "Status_check_failed",
+                    ]
+                )
+                time.sleep(120) 
+
+                cloudwatch.put_metric_alarm(
+                    AlarmName= response["Instances"][0]["InstanceId"] + "Status_check_failed",
+                    AlarmActions=[
+                        !Join [':',[arn:aws:sns, !Ref AWS::Region,!Ref AWS::AccountId,Launch-Fail-EC2-Trigger-Topic]],
+                        !Join [':',[arn:aws:automate, !Ref AWS::Region,ec2:terminate]],
+                    ], 
+                    ComparisonOperator="GreaterThanOrEqualToThreshold",
+                    EvaluationPeriods=2,
+                    DatapointsToAlarm=2,
+                    MetricName="StatusCheckFailed",
+                    Namespace="AWS/EC2",
+                    Period=60,
+                    Statistic="Average",
+                    Threshold=1.0,
+                    ActionsEnabled=False,
+                    TreatMissingData= "breaching",
+                    Dimensions=[
+                        {
+                            "Name": "InstanceId", 
+                            "Value": response["Instances"][0]["InstanceId"],
+                        },
+                    ],
+                    Unit="Seconds"
+                )
+
+                
+      Runtime: python3.6
+      Timeout: 240
+
+
+
+  AMIDeletionLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: "Infra-Automate-AMI-Delete"
+      Role: !Sub ${LambdaExecutionRole.Arn}
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+            import boto3
+            import collections
+            import datetime
+            import time
+            import sys
+
+            ec = boto3.client("ec2")
+            ec2 = boto3.resource("ec2")
+
+            def lambda_handler(event, context):
+
+                reservations = ec.describe_instances(
+                    Filters=[
+                        {"Name": "tag-value", "Values": ["backup", "Backup"]},
+                    ]
+                ).get(
+                    "Reservations", []
+                )
+
+                instances = sum(
+                    [
+                        [i for i in r["Instances"]]
+                        for r in reservations
+                    ], [])
+                print("Found %d instances that need evaluated" % len(instances))
+
+                to_tag = collections.defaultdict(list)
+
+                date = datetime.datetime.now()
+                date_fmt = date.strftime("%Y-%m-%d")
+                
+                imagesList = []
+                backupSuccess = False
+                imagecount = 0
+                
+                for instance in instances:
+                    images = ec2.images.filter(Owners=["self"],Filters=[{"Name":"tag-value","Values":[instance["InstanceId"]]}])
+                    for image in images:
+                        print(image)
+                        if image.name.startswith("Lambda - " + instance["InstanceId"]):
+                            imagecount = imagecount + 1
+                            try:
+                                if image.tags is not None:
+                                    deletion_date = [
+                                        t.get("Value") for t in image.tags
+                                        if t["Key"] == "DeleteOn"][0]
+                                    delete_date = datetime.datetime.strptime(deletion_date, "%m-%d-%Y %H:%M:%S")
+                                    delete_date = delete_date.strftime("%m-%d-%Y %H:%M:%S")
+                                    print(delete_date)
+                            except IndexError:
+                                deletion_date = False
+                                delete_date = False
+
+                            delete_time = datetime.datetime.now() - datetime.timedelta(hours=6) 
+                            delete_time = delete_time.strftime("%m-%d-%Y %H:%M:%S")
+                            print(delete_time)
+                            #today_date = time.strptime(today_time, "%m-%d-%Y")
+
+                            if delete_date <= delete_time:
+                                imagesList.append(image.id)
+                                print(imagesList)
+
+                            if date_fmt in image.name:#if image.name.endswith(date_fmt):
+                                backupSuccess = True
+                                print("Latest backup from " + date_fmt + " was a success")
+                            else:
+                                print("Today Backup not done yet")
+                    if(imagecount >= 75):
+                        break
+                    print("instance " + instance["InstanceId"] + " has " + str(imagecount) + " AMIs")
+
+
+                    if backupSuccess == True:
+
+                        myAccount = boto3.client("sts").get_caller_identity()["Account"]
+                        snapshots = ec.describe_snapshots(MaxResults=1000, OwnerIds=[myAccount])["Snapshots"]
+
+                        imgcount=0
+                        for image in imagesList:
+                            imgcount=imgcount+1
+                            print("deregistering image %s" % image)
+                            amiResponse = ec.deregister_image(
+                                DryRun=False,
+                                ImageId=image,
+                            )
+                            print(amiResponse)
+
+                            for snapshot in snapshots:
+                                if snapshot["Description"].find(image) > 0:
+                                    snap = ec.delete_snapshot(SnapshotId=snapshot["SnapshotId"])
+                                    print("Deleting snapshot " + snapshot["SnapshotId"])
+
+                            if(imgcount>=75):
+                                break
+
+                    else:
+                        print("No current backup found. Termination suspended.")
+                            
+      Runtime: python3.6
+      Timeout: 120
+
+
+  
