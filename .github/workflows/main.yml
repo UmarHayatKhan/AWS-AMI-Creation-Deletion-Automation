@@ -1,0 +1,41 @@
+name: Deploy to stag
+
+on:
+  push:
+    branches: master
+
+jobs:
+  build:
+
+    container:
+      image: nortonfive/leavedates-php
+      credentials:
+        username: nortonfive
+        password: ${{ secrets.docker_hub_password}}
+    services:
+      db:
+        image: mysql
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Create Database
+      run: touch database/database.sqlite
+    - name: Install Dependencies
+      run: composer install -q --no-ansi --no-interaction --no-progress --no-scripts --optimize-autoloader
+    - name: Generate key
+      run: php artisan passport:keys
+    - name: Geo update
+      run: php artisan geoip:update
+
+    - name: Execute tests 
+   #   env:
+   #     DB_CONNECTION: sqlite
+   #     DB_DATABASE: database/database.sqlite
+      run: php artisan test --parallel --stop-on-failure
+
+    - name: configure aws region
+      run: aws configure set default.region ${AWS_REGION} && \
+    - name: push artifact to s3
+      run: aws deploy push --application-name ${AWS_CODEDEPLOY_APP_STAG} --s3-location s3://${AWS_S3_BUCKET_STAG}/packages/${BITBUCKET_COMMIT}.zip
+    - name: create deployment in code deploy
+      run: aws deploy create-deployment --application-name ${AWS_CODEDEPLOY_APP_STAG} --s3-location bucket=${AWS_S3_BUCKET_STAG},key=packages/${BITBUCKET_COMMIT}.zip,bundleType=zip --deployment-group-name ${AWS_CODEDEPLOY_GROUP_STAG}
