@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-
+    runs-on: ubuntu-latest
     container:
       image: nortonfive/leavedates-php
       credentials:
