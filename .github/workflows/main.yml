@@ -11,7 +11,7 @@ jobs:
       image: nortonfive/leavedates-php
       credentials:
         username: nortonfive
-        password: ${{ secrets.docker_hub_password}}
+        password: ${{secrets.docker_hub_password}}
     services:
       db:
         image: mysql
